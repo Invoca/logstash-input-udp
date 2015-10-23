@@ -77,6 +77,8 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
       Thread.new { inputworker(i) }
     end
 
+    Thread.new { cleanup_buffers }
+
     while true
       #collect datagram message and add to queue
       payload, client = @udp.recvfrom(@buffer_size)
@@ -99,6 +101,7 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
         buffer = nil
         @buffers_mutex.synchronize do
           buffer = @buffers[client] ||= { buffer: FileWatch::BufferedTokenizer.new, mutex: Mutex.new }
+          @buffers[client][:last_used] = Time.now
         end
 
         buffer[:mutex].synchronize do
@@ -114,16 +117,33 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
 
         if found
           @buffers_mutex.synchronize do
-            @buffers[client] = nil
+            @buffers.delete(client)
           end
         end
-
       end
     rescue => e
       @logger.error("Exception in inputworker", "exception" => e, "backtrace" => e.backtrace)
       retry
     end
   end # def inputworker
+
+  def cleanup_buffers
+    loop do
+      @buffers_mutex.synchronize do
+        before_size = @buffers.size
+        @buffers.delete_if do |_client, buffer|
+          buffer[:last_used] < Time.now - 60
+        end
+
+        purged = before_size - @buffers.size
+        if purged > 0
+          @logger.warn("Purged #{purged} stale buffers of #{before_size}")
+        end
+      end
+
+      sleep 60
+    end
+  end
 
   public
   def teardown
