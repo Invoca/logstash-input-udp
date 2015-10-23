@@ -1,5 +1,6 @@
 # encoding: utf-8
 require "date"
+require "logstash/util/buftok"
 require "logstash/inputs/base"
 require "logstash/namespace"
 require "socket"
@@ -34,6 +35,8 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
   def initialize(params)
     super
     BasicSocket.do_not_reverse_lookup = true
+    @buffers = {}
+    @buffers_mutex = Mutex.new
   end # def initialize
 
   public
@@ -43,7 +46,7 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
 
   public
   def run(output_queue)
-  @output_queue = output_queue
+    @output_queue = output_queue
     begin
       # udp server
       udp_listener(output_queue)
@@ -92,14 +95,33 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
       while true
         payload, client = @input_to_worker.pop
 
-        @codec.decode(payload) do |event|
-          decorate(event)
-          event["host"] ||= client[3]
-          @output_queue.push(event)
+        found = false
+        buffer = nil
+        @buffers_mutex.synchronize do
+          buffer = @buffers[client] ||= { buffer: FileWatch::BufferedTokenizer.new, mutex: Mutex.new }
         end
+
+        buffer[:mutex].synchronize do
+          buffer[:buffer].extract(payload).each do |line|
+            @codec.decode(line) do |event|
+              found = true
+              decorate(event)
+              event["host"] ||= client[3]
+              @output_queue.push(event)
+            end
+          end
+        end
+
+        if found
+          @buffers_mutex.synchronize do
+            @buffers[client] = nil
+          end
+        end
+
       end
     rescue => e
       @logger.error("Exception in inputworker", "exception" => e, "backtrace" => e.backtrace)
+      retry
     end
   end # def inputworker
 
