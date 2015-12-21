@@ -1,5 +1,6 @@
 # encoding: utf-8
 require "date"
+require "logstash/util/buftok"
 require "logstash/inputs/base"
 require "logstash/namespace"
 require "socket"
@@ -34,6 +35,8 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
   def initialize(params)
     super
     BasicSocket.do_not_reverse_lookup = true
+    @buffers = {}
+    @buffers_mutex = Mutex.new
   end # def initialize
 
   public
@@ -43,7 +46,7 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
 
   public
   def run(output_queue)
-  @output_queue = output_queue
+    @output_queue = output_queue
     begin
       # udp server
       udp_listener(output_queue)
@@ -74,6 +77,8 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
       Thread.new { inputworker(i) }
     end
 
+    Thread.new { cleanup_buffers }
+
     while true
       #collect datagram message and add to queue
       payload, client = @udp.recvfrom(@buffer_size)
@@ -92,16 +97,53 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
       while true
         payload, client = @input_to_worker.pop
 
-        @codec.decode(payload) do |event|
-          decorate(event)
-          event["host"] ||= client[3]
-          @output_queue.push(event)
+        found = false
+        buffer = nil
+        @buffers_mutex.synchronize do
+          buffer = @buffers[client] ||= { buffer: FileWatch::BufferedTokenizer.new, mutex: Mutex.new }
+          @buffers[client][:last_used] = Time.now
+        end
+
+        buffer[:mutex].synchronize do
+          buffer[:buffer].extract(payload).each do |line|
+            @codec.decode(line) do |event|
+              found = true
+              decorate(event)
+              event["host"] ||= client[3]
+              @output_queue.push(event)
+            end
+          end
+        end
+
+        if found
+          @buffers_mutex.synchronize do
+            @buffers.delete(client)
+          end
         end
       end
     rescue => e
       @logger.error("Exception in inputworker", "exception" => e, "backtrace" => e.backtrace)
+      retry
     end
   end # def inputworker
+
+  def cleanup_buffers
+    loop do
+      @buffers_mutex.synchronize do
+        before_size = @buffers.size
+        @buffers.delete_if do |_client, buffer|
+          buffer[:last_used] < Time.now - 60
+        end
+
+        purged = before_size - @buffers.size
+        if purged > 0
+          @logger.warn("Purged #{purged} stale buffers of #{before_size}")
+        end
+      end
+
+      sleep 60
+    end
+  end
 
   public
   def teardown
