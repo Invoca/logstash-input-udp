@@ -110,7 +110,14 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
               found = true
               decorate(event)
               event["host"] ||= client[3]
-              @output_queue.push(event)
+
+              # Look for very long fields indicative of udp reordering that somehow resulted in valid JSON
+              max_field_length = event.to_hash.keys.map(&:length).max
+              if max_field_length < 1000
+                @output_queue.push(event)
+              else
+                @logger.info("field too long #{event.to_hash.to_s}")
+              end
             end
           end
         end
