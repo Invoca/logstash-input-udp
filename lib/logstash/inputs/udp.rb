@@ -154,7 +154,7 @@ class LogStash::Inputs::Udp < LogStash::Inputs::Base
   def max_field_length(hash)
     hash.map do |k,v|
       if v.is_a?(Hash)
-        max_field_length(v)
+        [k.length, max_field_length(v)].max
       else
         k.length
       end
